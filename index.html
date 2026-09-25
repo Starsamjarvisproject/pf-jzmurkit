@@ -22,17 +22,37 @@
   const local = (h === 'localhost' || h === '127.0.0.1' || h === '');
   if (local && !/[?&#]pont=1/.test(location.search + location.hash)) return;
   const URL_SERVEUR = 'https://script.google.com/macros/s/AKfycbxjicFrmGTKaeFflGy0FD7ESSONtCaZPzSwltxlydojcSMdZ6QUx3s8od_QQT7Qw0SGjA/exec';
+  // Apps Script renvoie parfois une page HTML au lieu du JSON (demarrage a froid, indisponibilite passagere) : la
+  // requete n'a alors pas ete traitee, on la renvoie jusqu'a 3 fois avant de signaler une vraie erreur lisible.
+  async function envoyer(corps) {
+    let dernier = '';
+    for (let essai = 0; essai < 3; essai++) {
+      if (essai > 0) await new Promise(r => setTimeout(r, 1500 * essai));
+      let texte = '';
+      try {
+        const r = await fetch(URL_SERVEUR, { method: 'POST', body: corps });
+        texte = await r.text();
+      } catch (e) { dernier = 'réseau : ' + (e && e.message ? e.message : e); continue; }
+      const t = texte.replace(/^\s+/, '');
+      if (t.charAt(0) === '{') {
+        try { return JSON.parse(t); } catch (e) { dernier = 'réponse illisible'; continue; }
+      }
+      dernier = 'le serveur a répondu une page inattendue';
+    }
+    throw new Error('Connexion au serveur impossible (' + dernier + '). Réessaie dans quelques secondes.');
+  }
   function appeler(fn, args, ok, ko) {
     let token = '';
     try { if (typeof SESSION !== 'undefined' && SESSION && SESSION.token) token = SESSION.token; } catch (e) {}
-    fetch(URL_SERVEUR, { method: 'POST', body: JSON.stringify({ action: 'rpc', fn: fn, args: args, token: token }) })
-      .then(r => r.json())
-      .then(j => {
-        if (j && j.ok) { if (ok) ok(j.donnees); }
-        else if (ko) ko({ message: (j && j.erreur) || 'Erreur serveur' });
+    envoyer(JSON.stringify({ action: 'rpc', fn: fn, args: args, token: token })).then(
+      j => {
+        // Les erreurs du CODE DE L'ECRAN (callbacks) ne doivent jamais etre confondues avec une erreur serveur.
+        if (j && j.ok) { if (ok) { try { ok(j.donnees); } catch (e) { console.error('[pont] callback', fn, e); } } }
+        else if (ko) { try { ko({ message: (j && j.erreur) || 'Erreur serveur' }); } catch (e) { console.error('[pont] callback', fn, e); } }
         else console.error('[pont]', fn, j && j.erreur);
-      })
-      .catch(e => { if (ko) ko({ message: e && e.message ? e.message : String(e) }); else console.error('[pont]', fn, e); });
+      },
+      e => { if (ko) { try { ko({ message: e && e.message ? e.message : String(e) }); } catch (e2) { console.error('[pont]', fn, e2); } } else console.error('[pont]', fn, e); }
+    );
   }
   function creerRun(ok, ko) {
     return new Proxy({}, {
@@ -46,6 +66,12 @@
     });
   }
   window.__pontHTTP = true;
+  // SIA integree : uniquement en version hebergee (le micro est bloque dans l'iframe Apps Script).
+  document.addEventListener('DOMContentLoaded', function () {
+    const s = document.createElement('script');
+    s.src = 'sia-widget.js?v=' + Date.now();
+    document.head.appendChild(s);
+  });
   window.google = {
     script: {
       get run() { return creerRun(null, null); },
@@ -1670,6 +1696,8 @@ function ouvrirFicheDepuisLien() {
 const URL_ASSISTANTE = 'https://starsamjarvisproject.github.io/assistante-/';
 function ouvrirAssistante() {
   if (!SESSION || !SESSION.token) return;
+  // Version hebergee : SIA est dans la page (bouton flottant) -- on la lance directement, sans autre onglet.
+  if (window.SIA) { window.SIA.ouvrir(); return; }
   window.open(URL_ASSISTANTE + '#t=' + encodeURIComponent(SESSION.token), '_blank');
 }
 
@@ -1683,11 +1711,13 @@ let __empreintePage = null;
 async function verifierPageHebergee() {
   if (!window.__pontHTTP) return;
   try {
-    const r = await fetch(location.pathname, { method: 'HEAD', cache: 'no-store' });
-    const e = r.headers.get('etag') || r.headers.get('last-modified') || r.headers.get('content-length');
-    if (!e) return;
+    const base = location.pathname.replace(/[^/]*$/, '');
+    const marque = async u => { const r = await fetch(u, { method: 'HEAD', cache: 'no-store' }); return r.headers.get('etag') || r.headers.get('last-modified') || r.headers.get('content-length') || ''; };
+    const e = (await marque(location.pathname)) + '|' + (await marque(base + 'sia-widget.js'));
+    if (e === '|') return;
     if (__empreintePage === null) { __empreintePage = e; return; }
     if (e === __empreintePage) return;
+    if (window.SIA && window.SIA.actif()) return; // jamais pendant une conversation avec SIA
     if (document.getElementById('screen-fiche')?.classList.contains('active') && ficheADesDonneesNonSauvegardees()) return;
     showToast('🔄 Nouvelle version disponible, rechargement...');
     setTimeout(() => location.reload(), 1500);
@@ -1699,6 +1729,7 @@ function verifierNouvelleVersion() {
   google.script.run
     .withSuccessHandler(v => {
       if (!window.__versionChargee || !v || v === window.__versionChargee) return;
+      if (window.SIA && window.SIA.actif()) return; // jamais pendant une conversation avec SIA
       // Ne jamais ecraser une saisie en cours sur une fiche (note, rappel, CR RDV non sauvegarde)
       // -- on retentera au prochain cycle plutot que de forcer un rechargement destructeur.
       if (document.getElementById('screen-fiche')?.classList.contains('active') && ficheADesDonneesNonSauvegardees()) return;
